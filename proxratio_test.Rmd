@@ -1,0 +1,163 @@
+---
+title: "Proximity ratio trial"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+library(tidyverse)
+library(tidygeocoder)
+library(nngeo)
+library(tidycensus)
+library(tigris)
+library(sf)
+library(tmap)
+library(mapboxapi)
+
+
+dg_stores<-read_csv("data/georgia_dg_sample_2023_12_02.csv") %>%
+  filter(is.na(long)==FALSE) %>%
+  st_as_sf(coords=c("long","lat"),crs=4326)%>%
+    mutate(rowid=row_number())
+
+# cty_sel<-c("Fulton","DeKalb","Gwinnett","Clayton","Cobb","Forsyth",
+#             "Cherokee","Rockdale","Henry","Douglas","Coweta","Fayette")
+ cty_sel<-c("Fulton","DeKalb","Clayton","Cobb","Gwinnett")
+
+counties<-counties() %>%
+  filter(STATEFP=="13" & NAME %in% cty_sel)
+
+tracts<-tracts(state="GA") %>%
+  filter(COUNTYFP %in% counties$COUNTYFP) #%>%
+#     st_centroid() %>%
+#       st_transform(4326)
+# 
+# tm_shape(tracts)+tm_dots()
+# 
+# st_write(tracts,"data/atltracts_core.gpkg",delete_dsn=TRUE)
+tracts_dots<-st_read("data/atltracts_core.gpkg") 
+```
+
+Calculate the five overall stores closest to each block and the five with produce.
+
+```{r}
+dg_stores_match<-st_nn(tracts,dg_stores,k=5,parallel=8,returnDist=TRUE) 
+
+dg_store_dist<-do.call(rbind.data.frame,dg_stores_match$dist)%>%
+  `colnames<-`(c("D1","D2","D3","D4","D5")) %>%
+  bind_cols(tracts %>% st_set_geometry(NULL) %>% select(GEOID)) %>%
+  pivot_longer(D1:D5,names_to="dist_type",values_to="dist") 
+
+dg_stores_match_df<-do.call(rbind.data.frame,dg_stores_match$nn) %>%
+  `colnames<-`(c("D1","D2","D3","D4","D5")) %>%
+  bind_cols(tracts %>% st_set_geometry(NULL) %>% select(GEOID)) %>%
+  pivot_longer(D1:D5,names_to="dist_type",values_to="store_rowid") %>%
+  left_join(dg_store_dist)
+
+dg_stores_p<-dg_stores %>% 
+  filter(`Fresh Produce`==1) %>%
+  mutate(rowidp=row_number()) %>%
+  select(-rowid)
+
+dg_storesp_match<-st_nn(tracts,dg_stores_p,
+                        k=5,parallel=8,returnDist=TRUE) 
+
+dg_storep_dist<-do.call(rbind.data.frame,dg_storesp_match$dist)%>%
+  `colnames<-`(c("D1","D2","D3","D4","D5")) %>%
+  bind_cols(tracts %>% st_set_geometry(NULL) %>% select(GEOID)) %>%
+  pivot_longer(D1:D5,names_to="dist_type",values_to="dist") 
+
+dg_storesp_match_df<-do.call(rbind.data.frame,dg_storesp_match$nn) %>%
+  `colnames<-`(c("D1","D2","D3","D4","D5")) %>%
+  bind_cols(tracts %>% st_set_geometry(NULL) %>% select(GEOID)) %>%
+  pivot_longer(D1:D5,names_to="dist_type",values_to="store_rowid_p") %>%
+  left_join(dg_storep_dist)
+
+
+
+```
+
+Get mapbox drive times for all stores
+
+```{r}
+
+mb_times<-function(row_sel){
+  Sys.sleep(0.3)
+  od_sel<-dg_stores_match_df[row_sel,]
+  
+  tract_sel<-c(st_coordinates(tracts %>% filter(GEOID==od_sel$GEOID) %>% select(GEOID)))
+  dg_sel<-c(st_coordinates(dg_stores %>% filter(rowid==od_sel$store_rowid)))
+  
+  direct<-mb_directions(origin=tract_sel,destination=dg_sel)
+  data.frame(row=row_sel,
+             duration=direct$duration)
+}
+
+dg_durations<-map_df(1:nrow(dg_stores_match_df),possibly(mb_times))
+
+dg_stores_match_df_time<-dg_stores_match_df %>%
+  mutate(row=row_number()) %>%
+  left_join(dg_durations) %>%
+  group_by(GEOID) %>%
+  arrange(duration) %>%
+  mutate(mb_rank=paste("MB",row_number(),sep=""))
+write_csv(dg_stores_match_df_time,"data/atlfd_traveltimes.csv")
+
+```
+
+Get mapbox drive times for produce stores
+
+```{r}
+row_sel<-3
+mb_timesp<-function(row_sel){
+  Sys.sleep(0.3)
+  od_sel<-dg_storesp_match_df[row_sel,]
+  
+  tract_sel<-c(st_coordinates(tracts %>% filter(GEOID==od_sel$GEOID) %>% select(GEOID)))
+  dg_sel<-c(st_coordinates(dg_stores_p %>% filter(rowidp==od_sel$store_rowid_p)))
+  
+  direct<-mb_directions(origin=tract_sel,destination=dg_sel)
+  data.frame(row=row_sel,
+             duration=direct$duration)
+}
+
+dgp_durations<-map_df(1:nrow(dg_storesp_match_df),
+                      possibly(mb_timesp))
+
+dg_storesp_match_df_time<-dg_storesp_match_df %>%
+  mutate(row=row_number()) %>%
+  left_join(dgp_durations) %>%
+  arrange(GEOID,duration) %>%
+  group_by(GEOID) %>%
+  mutate(mb_rank=paste("MB",row_number(),sep=""))
+write_csv(dg_storesp_match_df_time,"data/atlfdp_traveltimes.csv")
+```
+
+Combine and create ratio
+
+```{r}
+dg_stores_match_df_time<-read_csv("data/atlfd_traveltimes.csv")
+dg_storesp_match_df_time<-read_csv("data/atlfdp_traveltimes.csv")
+
+pr_create<-dg_storesp_match_df_time %>%
+  select(GEOID,duration,mb_rank,dist) %>%
+  rename(durationp=duration,
+         distp=dist) %>%
+  left_join(dg_stores_match_df_time %>%
+              select(GEOID,duration,mb_rank,dist)) %>%
+  mutate(pratio=durationp/duration)
+
+pr_create_sf<-tracts %>%
+  left_join(pr_create)
+
+tmap_mode("view")
+tm_shape(pr_create_sf)+
+  tm_dots("pratio",style="jenks",size=0.7)+
+tm_shape(dg_stores %>% rename(produce=`Fresh Produce`))+
+  tm_dots("produce")
+
+st_write(pr_create_sf,"data/atl_dgratio_tract.gpkg",delete_dsn=TRUE)
+st_write(dg_stores,"data/dg_stores_atl.gpkg")
+```
+
