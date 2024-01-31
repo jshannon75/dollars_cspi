@@ -1,0 +1,224 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+library(RSelenium)
+library(purrr)
+library(tidyverse)
+library(rvest)
+library(XML)
+
+#Open browser for scraping
+rD <- rsDriver(browser = "firefox",
+               chromever = NULL)
+remDr <- rD$client
+# remDr$close()
+# rD$server$stop()
+
+
+```
+
+Get a list of the state store pages
+
+```{r}
+
+#Get xpaths for state pages in the store directory
+xpath_list<-data.frame(part1="/html/body/div[4]/div/div[2]/div/div[2]/div[2]/div[",
+                       part2=1:50,part3="]/p/a") %>%
+  unite(col="xpath",c(part1,part2,part3),sep="")
+
+state_url_list<-function(xpath_sel){
+  state_page<-remDr$findElement(using="xpath",
+                                value=xpath_sel)
+
+  data.frame(state_url=state_page$getElementAttribute("href")[[1]])
+}
+
+state_urls<-map_df(xpath_list$xpath,state_url_list)
+
+
+
+```
+
+Get a list of cities with Dollar Generals in each state. This function pulls all the URLs from each state page, filtering for just those pointing to a specific town.
+
+```{r}
+ga_urls<-state_urls %>% filter(str_detect(state_url,"ga"))
+
+#url_sel<-as.character(ga_urls)
+
+store_link_scrape<-function(url_sel){
+  remDr$deleteAllCookies()
+  remDr$navigate(url_sel)
+  
+  page<-remDr$getPageSource()[[1]] %>%
+  read_html() 
+  
+  doc <- htmlTreeParse(page, useInternal=T)
+  links_state<-data.frame(urls=xpathSApply(doc, "//a[@href]", xmlGetAttr, "href"))#%>%
+    #filter(str_detect(urls,"https") & str_detect(urls,"locations"))
+}
+
+
+city_pages<-map_df(ga_urls$state_url,store_link_scrape) 
+
+city_pages_url<-city_pages %>%
+  separate(urls,into=c("a","pageend"),sep="en/") %>%
+  filter(str_detect(pageend,"directory/")) %>%
+  mutate(city_url=paste("https://www.dollargeneral.com/",pageend,sep=""))
+
+
+###NOW SAVED TO THIS POINT
+write_csv(city_pages_url,"data/dg_citypages_url_ga.csv")
+
+```
+
+Get store links for just Georgia (in this case)
+
+```{r}
+city_pages_url<-read_csv("data/dg_citypages_url_ga.csv")
+
+store_link_scrape1<-function(url_sel){
+  remDr$deleteAllCookies()
+  remDr$navigate(url_sel)
+  sleep_period=runif(1,min=0.5,max=3.5) #Vary the wait times to avoid bot detection
+  
+  Sys.sleep(sleep_period)
+  
+  page<-remDr$getPageSource()[[1]] %>%
+  read_html() 
+  
+  doc <- htmlTreeParse(page, useInternal=T)
+  links_state<-data.frame(urls=xpathSApply(doc, "//a[@href]", xmlGetAttr, "href")) #%>%
+    #filter(str_detect(urls,"store-directory/")) #%>%
+    #filter(urls!="/content/dollargeneral/en/store-directory/ga")
+  links_state
+}
+
+# city_pages_url_10<-city_pages_url %>%
+#   filter(row_number(.)<10)
+# 
+# testurl<-as.character(city_pages_url_10[1,]$city_url)
+# test<-store_link_scrape1(testurl) 
+
+
+store_pages_ga<-map_df(city_pages_url[1:2,]$city_url,store_link_scrape1)
+
+store_pages_ga1<-store_pages_ga %>%
+  filter(urls!="/content/dollargeneral/en/store-directory/ga") %>%
+  separate(urls,into=c("a","pageend"),sep="/en/",remove=FALSE) %>%
+  filter(str_detect(pageend,"directory/")) %>%
+  mutate(store_url=paste("https://www.dollargeneral.com/",pageend,sep="")) %>%
+  separate(store_url,into=c("city_url","store"),sep="/[0-9]",remove=FALSE) %>%
+  select(-store)
+
+city_pages_url_redo<-city_pages_url %>%
+  anti_join(store_pages_ga1,by="city_url")
+
+stores_pages_ga_redo<-map_df(city_pages_url_redo$city_url,store_link_scrape1)
+
+
+```
+
+
+
+Load store pages
+```{r}
+store_pages<-read_csv("data/dg_store_links.csv") %>%
+  mutate(store_url2=str_replace(store_url,
+                    "https://www.dollargeneral.com/content/dollargeneral/en/store-directory/","")) %>%
+  separate(store_url2,sep="/",into=c("state","city","store_id"),
+           remove=FALSE)
+
+#Open browser for scrpaing
+rD <- rsDriver(browser = "firefox",
+               chromever = NULL)
+remDr <- rD$client
+remDr$close()
+rD$server$stop()
+
+url_sel<-sample_n(store_pages,1)
+url_test<-sample_n(store_pages,20)
+
+
+url_extract<-function(url_sel){
+  url_sep<-separate(data.frame(url_temp=
+                                 str_replace(url_sel,
+                                  "https://www.dollargeneral.com/content/dollargeneral/en/store-directory/","")),
+                    col=url_temp,sep="/",into=c("a","b","store_id"))
+
+  remDr$navigate(url_sel)
+  Sys.sleep(5)
+  
+  #Store info
+  st_address_x<-remDr$findElement(using="xpath",
+                                value="/html/body/div[4]/div/div[2]/div/div/div[1]/div[1]/h1")
+  st_address<-st_address_x$getElementText()[[1]]
+  
+  city_x<-remDr$findElement(using="xpath",
+                            value="/html/body/div[4]/div/div[2]/div/div/div[1]/div[1]/div")
+  city<-city_x$getElementText()[[1]]
+  
+  latlong_x<-remDr$findElement(using="xpath",
+                             value="/html/body/div[4]/div/div[2]/div/div/div[1]/div[2]")
+  lat<-latlong_x$getElementAttribute(attrName = "data-latitude")[[1]]
+  long<-latlong_x$getElementAttribute(attrName = "data-longitude")[[1]]
+  
+  #Store services
+  services <- remDr$findElement(using = "xpath",
+                                 value = '/html/body/div[4]/div/div[2]/div/div/div[5]/div[2]/ul')
+  list_count<-length(services$findChildElements(using="xpath",value="li"))
+
+  list_extract<-function(item_sel){
+    value_xsel<-paste("/html/body/div[4]/div/div[2]/div/div/div[5]/div[2]/ul/li[",item_sel,"]/span",sep="")
+    value_item<-remDr$findElement(using = "xpath",
+                                  value = value_xsel)
+    value_item$getElementText()[[1]]
+  }
+  
+  data.frame(store_service=t(data.frame(map(1:list_count,list_extract))),
+                     row.names=NULL) %>%
+    mutate(store_id=url_sep$store_id,
+           address=st_address,
+           city_url=city,
+           lat=lat,
+           long=long)
+}
+
+ga<-store_pages %>%
+  filter(state=="ga")
+
+ga_services<-map_df(ga$store_url,possibly(url_extract))
+
+check<-anti_join(ga,ga_services)
+
+ga_services2<-map_df(check$store_url,possibly(url_extract))
+
+check2<-anti_join(check,ga_services2)
+
+ga_services3<-map_df(check2$store_url,possibly(url_extract))
+
+check3<-anti_join(check2,ga_services3)
+
+ga_services_all<-ga_services %>%
+  bind_rows(ga_services2) %>%
+  bind_rows(ga_services3) %>%
+  mutate(dummy=1) %>%
+  pivot_wider(names_from=store_service,values_from=dummy,values_fill=0) %>%
+  right_join(ga) %>%
+  select(store_url,state,address,city,city_url,store_id,lat,long,everything()) %>%
+  select(-store_url2)
+
+write_csv(ga_services_all,"data/georgia_sample_2023_12_02.csv")
+
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
